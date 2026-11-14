@@ -438,6 +438,16 @@ impl DnsCache {
             });
         }
 
+        // SRV, TXT and NSEC records can be cached without a PTR pointing at them (an
+        // answer without PTR records is for us by default), so the walk above never
+        // reaches them. Drop every expired one, and any name left with no records.
+        for map in [&mut self.srv, &mut self.txt, &mut self.nsec] {
+            map.retain(|_, records| {
+                records.retain(|r| !r.record.get_record().is_expired(now));
+                !records.is_empty()
+            });
+        }
+
         expired_instances
     }
 
@@ -902,7 +912,9 @@ fn apply_cache_flush(
 mod tests {
     use super::*;
     use crate::{
-        dns_parser::{DnsAddress, DnsPointer, DnsRecordExt, DnsSrv, DnsTxt, RRType, CLASS_IN},
+        dns_parser::{
+            DnsAddress, DnsNSec, DnsPointer, DnsRecordExt, DnsSrv, DnsTxt, RRType, CLASS_IN,
+        },
         service_info::MyIntf,
         MAX_PKT_DEFAULT,
     };
@@ -1129,5 +1141,52 @@ mod tests {
         let ptr = &cache.get_ptr(ty_domain).unwrap()[0].record;
         assert_eq!(ptr.get_expire(), ptr_expire - slept);
         assert_eq!(ptr.get_record().get_refresh_time(), ptr_refresh - slept);
+    }
+
+    /// A response whose answers carry SRV/TXT/NSEC but no PTR (an answer to an instance
+    /// query, for example) is "for us" by default, so its records are cached with no PTR
+    /// pointing at them. Once they expire they must still be evicted; otherwise every
+    /// distinct instance name ever seen on the network stays in the cache.
+    #[test]
+    fn test_expired_records_without_ptr_are_evicted() {
+        let intf = make_intf("en0", 1);
+        let mut cache = DnsCache::new();
+        let mut timers = Vec::new();
+        let gone = "gone-1._other._udp.local.";
+        let live = "live-1._other._udp.local.";
+        for (instance, ttl) in [(gone, 30), (live, 4500)] {
+            cache.add_or_update(
+                &intf,
+                DnsSrv::new(instance, CLASS_IN, ttl, 0, 0, 80, "h.local.".to_string()).boxed(),
+                &mut timers,
+                true,
+            );
+            cache.add_or_update(
+                &intf,
+                DnsTxt::new(instance, CLASS_IN, ttl, vec![]).boxed(),
+                &mut timers,
+                true,
+            );
+            cache.add_or_update(
+                &intf,
+                DnsNSec::new(instance, CLASS_IN, ttl, instance.to_string(), vec![]).boxed(),
+                &mut timers,
+                true,
+            );
+        }
+        assert!(cache.ptr.is_empty(), "no PTR was cached");
+
+        cache.age_records(Duration::from_secs(60));
+        let expired = cache.evict_expired_services(Instant::now());
+
+        assert!(expired.is_empty(), "nobody browsed these instances");
+        for map in [&cache.srv, &cache.txt, &cache.nsec] {
+            let keys: Vec<&String> = map.keys().collect();
+            assert_eq!(
+                keys,
+                vec![&live.to_string()],
+                "only the live instance stays"
+            );
+        }
     }
 }
